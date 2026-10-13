@@ -1,0 +1,24 @@
+[rcd09-c1-vm-sftp-01]: ssh as root. not on AD
+[rcd09-c1-vm-repo-01]: no login
+[rcd09-c1-vm-abc-meraki-ddl_1-2_reset_server]: ssh as root. not on AD.
+[rcd09-d1-vm-ai-cluster-01-litellm-01]: it's a d1. POC server. should be going away
+[rcd09-c1-vm-gitlab-runner-vmc-01]: not on AD.
+[rcd09-c1-vm-gitlab-runner-vmc-02]: not on AD.
+[rcd09-c1-vm-harbor-01]: U24. not on AD.
+[rcd09-c1-vm-jakpas-01]: can't reach. no-awx-inv
+[rcd09-c1-vm-netapp-active-iq-um-01]: appliance.
+[rcd09-c1-vm-netbox-vmc-01]: being deleted
+[rcd09-c1-vm-oxidized-01]: ssh as root. not on AD.
+[rcd09-c1-vm-syslog-02]: ssh as ubuntu. not on AD.
+[rcd09-c1-ise-01]: appliance
+[rcd09-c1-ise-02]: appliance
+[rcd09-c1-vm-cpnr-auth-01]: remove from AWX inventory
+[rcd09-c1-vm-cpnr-cache-01]: remove from AWX inventory
+[rcd09-c1-vm-cpnr-auth-02]: remove from AWX inventory
+[rcd09-c1-vm-cpnr-regional-01]: remove from AWX inventory
+[rcd09-c1-vm-cpnr-cache-02]: remove from AWX inventory
+[rcd09-c1-vm-reset-ecms-01]: AD is broken. needs checked.
+[rcd09-c1-rabbitmq-svr-01]: Fixed.
+[rcd09-c1-rabbitmq-svr-02]: Fixed.
+[rcd09-c1-rabbitmq-svr-03]: Fixed.
+[rcd09-c1-vm-api-rate-limiter-01]: AD is broken. needs checked.

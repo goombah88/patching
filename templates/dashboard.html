@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Patching Dashboard</title>
+  <style>
+    :root {
+      --bg: #f6f0e8;
+      --bg-accent: #efe4d6;
+      --ink: #1f1b16;
+      --muted: #5c5146;
+      --card: #fffaf3;
+      --accent: #b45309;
+      --accent-2: #0f766e;
+      --border: #e4d7c7;
+      --shadow: 0 12px 30px rgba(31, 27, 22, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Fira Sans", "Helvetica Neue", sans-serif;
+      color: var(--ink);
+      background: radial-gradient(1200px 600px at 10% 0%, var(--bg-accent), var(--bg));
+      min-height: 100vh;
+    }
+
+    header {
+      padding: 24px 6vw 12px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 2.2rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      margin: 0;
+    }
+
+    main {
+      padding: 12px 6vw 36px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+
+    .card.subsection {
+      margin-top: 18px;
+      border-style: dashed;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 0.95rem;
+      align-items: center;
+    }
+
+    .section-title {
+      margin: 18px 0 8px;
+      font-size: 1rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .pill {
+      background: rgba(180, 83, 9, 0.12);
+      color: var(--accent);
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      letter-spacing: 0.02em;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 6px;
+    }
+
+    th, td {
+      padding: 10px 8px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.95rem;
+    }
+
+    th {
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+    }
+
+    .status {
+      font-weight: 600;
+    }
+
+    .status.Success {
+      color: var(--accent-2);
+    }
+
+    .status.Failed {
+      color: #b91c1c;
+    }
+
+    .empty {
+      padding: 16px 8px;
+      color: var(--muted);
+    }
+
+    .duration.overdue {
+      background: #1d4ed8;
+      color: #ffffff;
+      border-radius: 8px;
+      padding: 4px 8px;
+      display: inline-block;
+    }
+
+    @media (max-width: 720px) {
+      h1 {
+        font-size: 1.6rem;
+      }
+
+      th, td {
+        font-size: 0.85rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Patching Dashboard</h1>
+    <p class="subtitle">Live status updates from patching jobs.</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="meta">
+        <span class="pill">Auto-refresh: 30s</span>
+        <span id="last-updated">Last updated: --</span>
+      </div>
+
+      <div class="section-title">Running or Pending</div>
+      <table aria-label="Running patching status table">
+        <thead>
+          <tr>
+            <th>Host</th>
+            <th>Step</th>
+            <th>Status</th>
+            <th>Elapsed</th>
+          </tr>
+        </thead>
+        <tbody id="running-body">
+          <tr>
+            <td class="empty" colspan="4">Waiting for status updates...</td>
+          </tr>
+        </tbody>
+      </table>
+
+    </section>
+
+    <section class="card subsection">
+      <div class="section-title">Completed</div>
+      <table aria-label="Completed patching status table">
+        <thead>
+          <tr>
+            <th>Host</th>
+            <th>Step</th>
+            <th>Status</th>
+            <th>Elapsed</th>
+          </tr>
+        </thead>
+        <tbody id="completed-body">
+          <tr>
+            <td class="empty" colspan="4">No completed servers yet.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    const runningBody = document.getElementById("running-body");
+    const completedBody = document.getElementById("completed-body");
+    const lastUpdated = document.getElementById("last-updated");
+    const overdueSeconds = 20 * 60;
+
+    function formatDuration(totalSeconds) {
+      if (totalSeconds === null || totalSeconds === undefined) {
+        return "--";
+      }
+
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = Math.floor(totalSeconds % 60);
+      return [hours, minutes, seconds]
+        .map((value) => String(value).padStart(2, "0"))
+        .join(":");
+    }
+
+    function renderRows(rows, targetBody, emptyMessage) {
+      if (!rows.length) {
+        targetBody.innerHTML = "<tr><td class=\"empty\" colspan=\"4\">" + emptyMessage + "</td></tr>";
+        return;
+      }
+
+      targetBody.textContent = "";
+      rows.forEach((row) => {
+        const statusClass = row.status.replace(/\s+/g, "-");
+        const durationText = formatDuration(row.duration_seconds);
+        const isOverdue = row.running && row.duration_seconds >= overdueSeconds;
+        const durationClass = isOverdue ? "duration overdue" : "duration";
+
+        const tr = document.createElement("tr");
+
+        const hostCell = document.createElement("td");
+        hostCell.textContent = row.host;
+        tr.appendChild(hostCell);
+
+        const stepCell = document.createElement("td");
+        stepCell.textContent = row.step;
+        tr.appendChild(stepCell);
+
+        const statusCell = document.createElement("td");
+        statusCell.className = "status " + statusClass;
+        statusCell.textContent = row.status;
+        tr.appendChild(statusCell);
+
+        const durationCell = document.createElement("td");
+        const durationBadge = document.createElement("span");
+        durationBadge.className = durationClass;
+        durationBadge.textContent = durationText;
+        durationCell.appendChild(durationBadge);
+        tr.appendChild(durationCell);
+
+        targetBody.appendChild(tr);
+      });
+    }
+
+    async function refreshStatus() {
+      try {
+        const response = await fetch("/api/status");
+        const data = await response.json();
+        const runningRows = data.filter((row) => !row.completed);
+        const completedRows = data.filter((row) => row.completed);
+        renderRows(runningRows, runningBody, "Waiting for status updates...");
+        renderRows(completedRows, completedBody, "No completed servers yet.");
+        lastUpdated.textContent = "Last updated: " + new Date().toLocaleTimeString();
+      } catch (error) {
+        lastUpdated.textContent = "Last updated: error";
+      }
+    }
+
+    refreshStatus();
+    setInterval(refreshStatus, 30000);
+  </script>
+</body>
+</html>

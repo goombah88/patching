@@ -1,0 +1,163 @@
+As you can see from the leftover files, we have a few requirements. we are trying to create a home-grown patching solution 
+for a team that has no current patching strategy, so were essentially building it from the ground up.
+- self-hosted apt repo for each OS being patched - ubuntu, centos, RHEL, Windows, more?
+- web dashboard where users can see when their servers have started/finished so they don't have to bother us admins and we can concentrate on patching duties/issues.
+- a way for the servers being patched to "phone home" (most likely with REST API calls) with status updates to keep the dashboard up-to-date
+- way to report up to management some stats about patching, like how many servers patched/skipped/had issues, etc.
+
+Scope: Linux and Windows off the bat (CorpIT is targetting OSs and applications first)
+Patching orchestration: driving patching via Ansible
+State storage: Do you want a database (SQLite/Postgres) or just logs + CSV exports? sqlite3 database since it's built into python
+Real-time updates: collect updates real-time, but auto-refresh the status dashboard every 30 seconds
+
+Windows patching (Ansible + WinRM over HTTPS)
+
+Bootstrap (run as elevated PowerShell on each Windows host or via GPO):
+
+    winrm quickconfig -q
+    $fqdn = ([System.Net.Dns]::GetHostByName($env:COMPUTERNAME)).HostName
+    $cert = New-SelfSignedCertificate -DnsName $fqdn -CertStoreLocation Cert:\LocalMachine\My
+    winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=\"$fqdn\"; CertificateThumbprint=\"$($cert.Thumbprint)\"}"
+    Set-Item -Path WSMan:\localhost\Service\Auth\Basic -Value $true
+    Set-Item -Path WSMan:\localhost\Service\AllowUnencrypted -Value $false
+    Set-Item -Path WSMan:\localhost\Client\Auth\Basic -Value $true
+    New-NetFirewallRule -Name "WinRM HTTPS" -DisplayName "WinRM HTTPS" -Profile Any -LocalPort 5986 -Protocol TCP -Action Allow
+    Get-ChildItem WSMan:\localhost\Listener | Where-Object { $_.Keys -match "Transport=HTTP" } | Remove-Item -Recurse -Force
+
+Ansible inventory/group_vars (Windows):
+
+    ansible_connection=winrm
+    ansible_port=5986
+    ansible_winrm_transport=ntlm
+    ansible_winrm_server_cert_validation=ignore
+
+
+
+NOTES FROM PREVIOUS CX TRAINING ATTEMPT:
+
+Set up local apt repo using apt-mirror
+
+By Chad Crider
+Jan 19, 2024
+
+Followed this guide to setting up a local APT repo.
+
+Guide - How to Setup Local APT Repository Server on Ubuntu 22.04
+
+I mounted up 1 TB to /repo to hold the local repo data.
+
+Then, in /var/www/html/ubuntu/ I set up the symlink:
+
+archive.ubuntu.com -> /repo/mirror/archive.ubuntu.com//
+
+so that you would be able to use
+
+http://<REPO SERVER IP>/ubuntu/archive.ubuntu.com/ubuntu/ in the browser and in /etc/apt/sources.list
+
+to reach the repo like you would a normal public repo.
+
+
+
+Patching Automation
+
+By Chad Crider
+Mar 12, 2024
+
+PrePatchSetup.sh - ran on patching night to prepare a server for patching. make sure it can talk to our local repo, clean apt cache, make sure VM Tools is installed
+
+UpdatePatchingStatus.sh - used throughout patching to report the status of each step back to the Ansible server. This data is fed into the patching dashboard so that admins and the business can keep track of which servers are still patching and which ones are done.
+
+SetAPTProxy.sh - ran on Corp servers only and on each server only once. It will configure the proxy to force OS patches from ubuntu's repos to go to our local repo but allow 3rd party repos (like docker hub) to hit the internet.
+
+SetReposToPatching.py - run on all servers and only ran once. It will reconfigure /etc/apt/sources.list to point the Ubuntu repos to our local repo.
+
+
+Point server to local APT repo
+
+
+
+By Chad Crider
+Jan 19, 2024
+
+In order to point a server to our local repo for OS updates while still allowing it to reach out to the internet for 3rd party repos, 
+
+the following config must be created:
+
+Run the script SetAPTProxy.sh which does the following:
+
+
+
+Create the file - /etc/apt/apt.conf.d/80proxy - with the content:
+
+Acquire{
+
+    # Use DIRECT for local repositories on the local network
+    http::proxy::<REPO SERVER IP> "DIRECT";
+    http::proxy "http://proxy.esl.cisco.com:80";
+    # The following can be used as an alternative if needing to be more
+    # specific in which sites to allow the proxy server.
+    # http::proxy::download.docker.com "http://proxy.esl.cisco.com:80";
+}
+Acquire{
+    https::proxy::<REPO SERVER IP>:80 "DIRECT";
+    https::proxy "http://proxy.esl.cisco.com:80";
+}
+Acquire::ftp::proxy "ftp://proxy.esl.cisco.com:80";
+
+
+
+Then you can run the script SetReposToPatching.py to convert /etc/apt/sources.list from archive.ubuntu.com to the location of our repo server, which for Corp is <REPO SERVER IP>
+
+Ex.
+
+deb http://<REPO SERVER IP>/ubuntu/archive.ubuntu.com/ubuntu mantic main restricted
+deb http://<REPO SERVER IP>/ubuntu/archive.ubuntu.com/ubuntu mantic-updates main restricted
+deb http://<REPO SERVER IP>/ubuntu/archive.ubuntu.com/ubuntu mantic universe
+deb http://<REPO SERVER IP>/ubuntu/archive.ubuntu.com/ubuntu mantic-updates universe
+deb http://<REPO SERVER IP>/ubuntu/archive.ubuntu.com/ubuntu mantic multiverse
+deb http://<REPO SERVER IP>/ubuntu/archive.ubuntu.com/ubuntu mantic-updates multiverse
+deb http://<REPO SERVER IP>/ubuntu/archive.ubuntu.com/ubuntu mantic-backports main restricted universe multiverse
+
+
+
+
+SAPI - Server API
+
+By Chad Crider
+Mar 12, 2024
+
+SAPI is an API running on the Corp Ansible server sjc01-z0-vm-cxt-ansible-01. It allows server to "phone home" to trigger actions in ansible.
+
+Guide used to create the basic API - https://medium.com/@thishantha17/build-a-simple-python-rest-api-with-apache2-gunicorn-and-flask-on-ubuntu-18-04-c9d47639139b
+
+
+
+ENDPOINTS:
+
+Currently there are 2 endpoints defined.
+
+/status - servers use this endpoint during patching to report status updates. These status updates will feed the patching dashboard, allowing us to properly monitor how patching is going.
+/casa - (a.k.a. CheckAndSetAdmins) when servers hit this endpoint it will download the UnixAdmins.txt master file
+
+
+TECH STACK:
+
+The API itself is a Flask app written in python.
+Gunicorn is utilized to serve as the production-grade WSGI server
+nginx is used as a reverse proxy for gunicorn
+utilizes 2 docker images -
+sapi (built from python:3 image) - runs gunicorn which in turn runs the Flask app (sapi.py)
+sapi_nginx (nginx image)
+Port - 8000
+
+
+MISC:
+
+All files are stored in /docker-services/sapi on sjc01-z0-vm-cxt-ansible-01
+
+Example to test it:
+
+curl --noproxy '*' -i -H "Content-Type: application/json" -X POST -d '{"status":"X In Progress","host":"'"$host"'", "step":"warmup"}' http://$ANSIBLE_SERVER:$ANSIBLE_SERVER_PORT/status
+The answer you would get back is: 
+
+{"answer":"ACK"}

@@ -1,0 +1,533 @@
+---
+# Post-CIS Hardening Verification Playbook
+# Checks that core server functionality is intact after CIS benchmark hardening.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini cis_verify.yml
+#   ansible-playbook -i inventory.ini cis_verify.yml --limit rcd09-c1-vm-myserver-01
+#
+# Results are logged to /var/log/cis_verify.log on each host and summarized in the
+# play recap at the end.
+
+- name: Post-CIS hardening verification
+  hosts: linux
+  become: true
+  gather_facts: true
+
+  vars:
+    # Base directory on the AWX controller where logs are written
+    log_base_dir: "{{ log_base_dir | default('./cis_verify_logs') }}"
+    log_dir: "{{ log_base_dir }}/{{ inventory_hostname }}-{{ ansible_date_time.date }}-{{ ansible_date_time.time | regex_replace(':', '') }}"
+    log_file: "{{ log_dir }}/cis_verify.log"
+    # AD domain check — override via extra vars or group_vars
+    ad_domain: "{{ ad_domain | default('') }}"
+    # A known AD user to test lookup with (no auth required — just id/getent)
+    ad_test_user: "{{ ad_test_user | default('') }}"
+    # DNS hostnames to resolve as a connectivity smoke test
+    dns_test_hosts:
+      - "{{ ad_domain if ad_domain != '' else 'google.com' }}"
+    # NTP servers expected to be in use (optional — leave empty to skip)
+    ntp_servers: "{{ ntp_servers | default([]) }}"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # Initialise log file (written locally on the AWX controller)
+    # -------------------------------------------------------------------------
+    - name: Create local log directory
+      ansible.builtin.file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Initialise log file
+      ansible.builtin.copy:
+        dest: "{{ log_file }}"
+        content: |
+          ============================================================
+          CIS Post-Hardening Verification
+          Host   : {{ inventory_hostname }}
+          Date   : {{ ansible_date_time.iso8601 }}
+          OS     : {{ ansible_distribution }} {{ ansible_distribution_version }}
+          ============================================================
+        mode: "0640"
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # Helper macro — append a result line to the log
+    # -------------------------------------------------------------------------
+    # Used via: set_fact + lineinfile throughout the play.
+
+    # -------------------------------------------------------------------------
+    # 1. SSH
+    # -------------------------------------------------------------------------
+    - name: Check sshd service is running
+      ansible.builtin.service_facts:
+
+    - name: Evaluate sshd state
+      ansible.builtin.set_fact:
+        sshd_ok: "{{ ansible_facts.services.get('sshd.service', ansible_facts.services.get('ssh.service', {})).get('state', 'unknown') == 'running' }}"
+
+    - name: Log SSH result
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if sshd_ok else 'FAIL' }}] SSH  : sshd service is {{ 'running' if sshd_ok else 'NOT running' }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Retrieve sshd_config key settings
+      ansible.builtin.shell: |
+        sshd -T 2>/dev/null | grep -E "^(permitrootlogin|passwordauthentication|pubkeyauthentication|protocol|permitemptypasswords|usepam)" || true
+      register: sshd_config_check
+      changed_when: false
+
+    - name: Log sshd_config summary
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[INFO] SSH  : {{ item }}"
+      loop: "{{ sshd_config_check.stdout_lines }}"
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # 2. Active Directory / SSSD / realmd
+    # -------------------------------------------------------------------------
+    - name: Check sssd service is running
+      ansible.builtin.set_fact:
+        sssd_ok: "{{ ansible_facts.services.get('sssd.service', {}).get('state', 'unknown') == 'running' }}"
+
+    - name: Log SSSD result
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if sssd_ok else 'FAIL' }}] AD   : sssd service is {{ 'running' if sssd_ok else 'NOT running' }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Run realm list
+      ansible.builtin.command: realm list
+      register: realm_list
+      changed_when: false
+      failed_when: false
+
+    - name: Evaluate realm enrollment
+      ansible.builtin.set_fact:
+        realm_ok: "{{ realm_list.rc == 0 and realm_list.stdout | length > 0 }}"
+
+    - name: Log realm result
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if realm_ok else 'FAIL' }}] AD   : realm enrollment {{ 'detected' if realm_ok else 'NOT detected' }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Log realm detail
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[INFO] AD   : {{ item }}"
+      loop: "{{ realm_list.stdout_lines }}"
+      when: realm_list.stdout_lines | length > 0
+      delegate_to: localhost
+      become: false
+
+    - name: Check AD domain in sssd.conf
+      ansible.builtin.shell: |
+        grep -i "^domains" /etc/sssd/sssd.conf 2>/dev/null || echo "NOT FOUND"
+      register: sssd_domains
+      changed_when: false
+      failed_when: false
+
+    - name: Log sssd domains
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[INFO] AD   : sssd.conf {{ sssd_domains.stdout }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Look up AD test user (getent)
+      ansible.builtin.command: "getent passwd {{ ad_test_user }}"
+      register: getent_user
+      changed_when: false
+      failed_when: false
+      when: ad_test_user != ''
+
+    - name: Evaluate AD user lookup
+      ansible.builtin.set_fact:
+        ad_user_ok: "{{ getent_user.rc == 0 }}"
+      when: ad_test_user != ''
+
+    - name: Log AD user lookup
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if ad_user_ok else 'FAIL' }}] AD   : getent lookup for {{ ad_test_user }} {{ 'succeeded' if ad_user_ok else 'FAILED' }}"
+      when: ad_test_user != ''
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # 3. PAM
+    # -------------------------------------------------------------------------
+    - name: Check PAM sshd file exists
+      ansible.builtin.stat:
+        path: /etc/pam.d/sshd
+      register: pam_sshd
+
+    - name: Check PAM common-auth file exists (Debian/Ubuntu)
+      ansible.builtin.stat:
+        path: /etc/pam.d/common-auth
+      register: pam_common_auth
+
+    - name: Check PAM system-auth file exists (RHEL/CentOS)
+      ansible.builtin.stat:
+        path: /etc/pam.d/system-auth
+      register: pam_system_auth
+
+    - name: Evaluate PAM files present
+      ansible.builtin.set_fact:
+        pam_ok: >-
+          {{ pam_sshd.stat.exists and
+             (pam_common_auth.stat.exists or pam_system_auth.stat.exists) }}
+
+    - name: Log PAM result
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if pam_ok else 'FAIL' }}] PAM  : key PAM files {{ 'present' if pam_ok else 'MISSING' }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Check SSSD is referenced in PAM
+      ansible.builtin.shell: |
+        grep -rl "pam_sss" /etc/pam.d/ 2>/dev/null | tr '\n' ' ' || echo "none"
+      register: pam_sss_refs
+      changed_when: false
+
+    - name: Log PAM SSSD references
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[INFO] PAM  : pam_sss referenced in: {{ pam_sss_refs.stdout }}"
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # 4. Sudo
+    # -------------------------------------------------------------------------
+    - name: Check sudoers file exists
+      ansible.builtin.stat:
+        path: /etc/sudoers
+      register: sudoers_file
+
+    - name: Validate sudoers syntax
+      ansible.builtin.command: visudo -c -f /etc/sudoers
+      register: sudoers_check
+      changed_when: false
+      failed_when: false
+
+    - name: Evaluate sudo
+      ansible.builtin.set_fact:
+        sudo_ok: "{{ sudoers_file.stat.exists and sudoers_check.rc == 0 }}"
+
+    - name: Log sudo result
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if sudo_ok else 'FAIL' }}] SUDO : sudoers syntax {{ 'valid' if sudo_ok else 'INVALID or missing' }}"
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # 5. DNS resolution
+    # -------------------------------------------------------------------------
+    - name: Resolve test hostnames
+      ansible.builtin.command: "getent hosts {{ item }}"
+      register: dns_results
+      changed_when: false
+      failed_when: false
+      loop: "{{ dns_test_hosts }}"
+
+    - name: Log DNS results
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if item.rc == 0 else 'FAIL' }}] DNS  : resolve {{ item.item }} -> {{ item.stdout if item.rc == 0 else 'FAILED' }}"
+      loop: "{{ dns_results.results }}"
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # 6. Time synchronisation (chrony / systemd-timesyncd)
+    # -------------------------------------------------------------------------
+    - name: Check chrony service
+      ansible.builtin.set_fact:
+        chrony_running: "{{ ansible_facts.services.get('chronyd.service', ansible_facts.services.get('chrony.service', {})).get('state', 'unknown') == 'running' }}"
+
+    - name: Check systemd-timesyncd service
+      ansible.builtin.set_fact:
+        timesyncd_running: "{{ ansible_facts.services.get('systemd-timesyncd.service', {}).get('state', 'unknown') == 'running' }}"
+
+    - name: Evaluate NTP
+      ansible.builtin.set_fact:
+        ntp_ok: "{{ chrony_running or timesyncd_running }}"
+
+    - name: Check chrony sync status
+      ansible.builtin.command: chronyc tracking
+      register: chrony_tracking
+      changed_when: false
+      failed_when: false
+      when: chrony_running
+
+    - name: Log NTP result
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if ntp_ok else 'FAIL' }}] NTP  : time sync {{ 'active (' + ('chrony' if chrony_running else 'timesyncd') + ')' if ntp_ok else 'NO time sync service running' }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Log chrony tracking
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[INFO] NTP  : {{ item }}"
+      loop: "{{ chrony_tracking.stdout_lines | default([]) }}"
+      when: chrony_running
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # 7. Firewall
+    # -------------------------------------------------------------------------
+    - name: Check ufw status (Debian/Ubuntu)
+      ansible.builtin.command: ufw status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Check firewalld status (RHEL/CentOS)
+      ansible.builtin.set_fact:
+        firewalld_running: "{{ ansible_facts.services.get('firewalld.service', {}).get('state', 'unknown') == 'running' }}"
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    - name: Evaluate firewall (Debian/Ubuntu)
+      ansible.builtin.set_fact:
+        fw_ok: "{{ 'Status: active' in ufw_status.stdout }}"
+        fw_detail: "{{ ufw_status.stdout_lines[0] | default('unknown') }}"
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Evaluate firewall (RHEL/CentOS)
+      ansible.builtin.set_fact:
+        fw_ok: "{{ firewalld_running }}"
+        fw_detail: "firewalld {{ 'running' if firewalld_running else 'NOT running' }}"
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    - name: Log firewall result
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if fw_ok else 'FAIL' }}] FW   : {{ fw_detail }}"
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # 8. Mandatory access control (AppArmor / SELinux)
+    # -------------------------------------------------------------------------
+    - name: Check AppArmor status (Debian/Ubuntu)
+      ansible.builtin.command: aa-status --complaining
+      register: apparmor_status
+      changed_when: false
+      failed_when: false
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Evaluate AppArmor
+      ansible.builtin.set_fact:
+        mac_ok: "{{ apparmor_status.rc == 0 }}"
+        mac_detail: "AppArmor {{ 'active' if apparmor_status.rc == 0 else 'NOT active / not installed — rc=' + apparmor_status.rc | string }}"
+      when: ansible_facts['os_family'] == 'Debian'
+
+    - name: Check SELinux status (RHEL/CentOS)
+      ansible.builtin.command: getenforce
+      register: selinux_status
+      changed_when: false
+      failed_when: false
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    - name: Evaluate SELinux
+      ansible.builtin.set_fact:
+        mac_ok: "{{ selinux_status.stdout in ['Enforcing', 'Permissive'] }}"
+        mac_detail: "SELinux {{ selinux_status.stdout }}"
+      when: ansible_facts['os_family'] == 'RedHat'
+
+    - name: Log MAC result
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if mac_ok else 'FAIL' }}] MAC  : {{ mac_detail }}"
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # 9. auditd
+    # -------------------------------------------------------------------------
+    - name: Evaluate auditd state
+      ansible.builtin.set_fact:
+        auditd_ok: "{{ ansible_facts.services.get('auditd.service', {}).get('state', 'unknown') == 'running' }}"
+
+    - name: Log auditd result
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if auditd_ok else 'FAIL' }}] AUDIT: auditd {{ 'running' if auditd_ok else 'NOT running' }}"
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # 10. Logging (rsyslog / syslog)
+    # -------------------------------------------------------------------------
+    - name: Evaluate rsyslog state
+      ansible.builtin.set_fact:
+        rsyslog_ok: "{{ ansible_facts.services.get('rsyslog.service', {}).get('state', 'unknown') == 'running' }}"
+
+    - name: Log rsyslog result
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[{{ 'PASS' if rsyslog_ok else 'FAIL' }}] LOG  : rsyslog {{ 'running' if rsyslog_ok else 'NOT running' }}"
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # 11. CIS-specific spot checks
+    # -------------------------------------------------------------------------
+    - name: Check umask in /etc/profile or /etc/bashrc
+      ansible.builtin.shell: |
+        grep -rh "^umask" /etc/profile /etc/profile.d/ /etc/bashrc /etc/bash.bashrc 2>/dev/null | head -5 || echo "NOT SET"
+      register: umask_check
+      changed_when: false
+
+    - name: Log umask
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[INFO] CIS  : umask settings: {{ umask_check.stdout_lines | join(' | ') }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Check password max age (/etc/login.defs)
+      ansible.builtin.shell: |
+        grep "^PASS_MAX_DAYS" /etc/login.defs 2>/dev/null || echo "PASS_MAX_DAYS NOT SET"
+      register: pass_max_days
+      changed_when: false
+
+    - name: Log password max age
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[INFO] CIS  : {{ pass_max_days.stdout }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Check /tmp is a separate mount or bind-mount
+      ansible.builtin.shell: |
+        findmnt /tmp --noheadings 2>/dev/null && echo "MOUNTED" || echo "NOT a separate mount"
+      register: tmp_mount
+      changed_when: false
+
+    - name: Log /tmp mount
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[INFO] CIS  : /tmp {{ tmp_mount.stdout }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Check core dumps disabled
+      ansible.builtin.shell: |
+        grep -rh "^*.*hard.*core" /etc/security/limits.conf /etc/security/limits.d/ 2>/dev/null || echo "NOT SET"
+      register: core_dumps
+      changed_when: false
+
+    - name: Log core dumps
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[INFO] CIS  : core dump limit: {{ core_dumps.stdout }}"
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # 12. Listening ports summary
+    # -------------------------------------------------------------------------
+    - name: Get listening TCP/UDP ports
+      ansible.builtin.shell: |
+        ss -tlnup 2>/dev/null || netstat -tlnup 2>/dev/null || echo "ss/netstat unavailable"
+      register: listening_ports
+      changed_when: false
+
+    - name: Log listening ports header
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[INFO] PORTS: Listening services ---"
+      delegate_to: localhost
+      become: false
+
+    - name: Log listening ports
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "[INFO] PORTS: {{ item }}"
+      loop: "{{ listening_ports.stdout_lines }}"
+      delegate_to: localhost
+      become: false
+
+    # -------------------------------------------------------------------------
+    # Build summary
+    # -------------------------------------------------------------------------
+    - name: Build check results dict
+      ansible.builtin.set_fact:
+        check_results:
+          ssh: "{{ sshd_ok }}"
+          sssd: "{{ sssd_ok }}"
+          realm: "{{ realm_ok }}"
+          pam: "{{ pam_ok }}"
+          sudo: "{{ sudo_ok }}"
+          ntp: "{{ ntp_ok }}"
+          firewall: "{{ fw_ok }}"
+          mac: "{{ mac_ok }}"
+          auditd: "{{ auditd_ok }}"
+          rsyslog: "{{ rsyslog_ok }}"
+
+    - name: Count failures
+      ansible.builtin.set_fact:
+        failed_checks: "{{ check_results | dict2items | selectattr('value', 'equalto', false) | map(attribute='key') | list }}"
+
+    - name: Append summary to log
+      ansible.builtin.blockinfile:
+        path: "{{ log_file }}"
+        block: |
+          ============================================================
+          CHECK RESULTS
+          ------------------------------------------------------------
+          SSH      : {{ 'PASS' if check_results.ssh     else 'FAIL' }}
+          SSSD     : {{ 'PASS' if check_results.sssd    else 'FAIL' }}
+          REALM    : {{ 'PASS' if check_results.realm   else 'FAIL' }}
+          PAM      : {{ 'PASS' if check_results.pam     else 'FAIL' }}
+          SUDO     : {{ 'PASS' if check_results.sudo    else 'FAIL' }}
+          NTP      : {{ 'PASS' if check_results.ntp     else 'FAIL' }}
+          FIREWALL : {{ 'PASS' if check_results.firewall else 'FAIL' }}
+          MAC      : {{ 'PASS' if check_results.mac     else 'FAIL' }}
+          AUDITD   : {{ 'PASS' if check_results.auditd  else 'FAIL' }}
+          RSYSLOG  : {{ 'PASS' if check_results.rsyslog else 'FAIL' }}
+          ------------------------------------------------------------
+          TOTAL    : {{ (check_results | dict2items | selectattr('value', 'equalto', true) | list | length) }} passed,
+                     {{ failed_checks | length }} failed
+          FAILED   : {{ failed_checks | join(', ') if failed_checks | length > 0 else 'none' }}
+          ============================================================
+        marker: "# {mark} SUMMARY BLOCK"
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch log file content
+      ansible.builtin.slurp:
+        src: "{{ log_file }}"
+      register: log_content
+      delegate_to: localhost
+      become: false
+
+    - name: Display full verification report
+      ansible.builtin.debug:
+        msg: "{{ (log_content.content | b64decode).split('\n') }}"
+
+    - name: Report overall status
+      ansible.builtin.debug:
+        msg: >-
+          {{ '[ALL PASSED]' if failed_checks | length == 0 else '[CHECKS FAILED] ' + failed_checks | join(', ') }}
+          — log: {{ log_file }}

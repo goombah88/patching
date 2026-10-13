@@ -1,0 +1,122 @@
+---
+- name: Linux patching
+  hosts: linux
+  become: true
+  gather_facts: true
+
+  vars:
+    status_url: "{{ status_url | default('http://127.0.0.1:9999/status') }}"
+    reboot_if_needed: "{{ reboot_if_needed | default(true) }}"
+
+  tasks:
+    - name: Set host name for status updates
+      ansible.builtin.set_fact:
+        patching_host: "{{ ansible_fqdn | default(inventory_hostname) }}"
+
+    - name: Report patching start
+      ansible.builtin.uri:
+        url: "{{ status_url }}"
+        method: POST
+        body_format: json
+        body:
+          host: "{{ patching_host }}"
+          step: "start"
+          status: "In Progress"
+      failed_when: false
+
+    - name: Patch operating system
+      block:
+        - name: Note package exclusions
+          ansible.builtin.debug:
+            msg: >-
+              Package exclusions are managed outside this playbook
+              (apt-mark hold or dnf versionlock).
+        - name: Update packages on Debian/Ubuntu
+          ansible.builtin.apt:
+            update_cache: true
+            upgrade: dist
+          when: ansible_facts['os_family'] == 'Debian'
+
+        - name: Update packages on RHEL/CentOS  # noqa package-latest
+          ansible.builtin.dnf:
+            name: "*"
+            state: latest
+          when: ansible_facts['os_family'] == 'RedHat'
+
+        - name: Check reboot flag on Debian/Ubuntu
+          ansible.builtin.stat:
+            path: /var/run/reboot-required
+          register: deb_reboot_required
+          when: ansible_facts['os_family'] == 'Debian'
+
+        - name: Check reboot flag on RHEL/CentOS
+          ansible.builtin.command: needs-restarting -r
+          register: rhel_reboot_required
+          changed_when: false
+          failed_when: false
+          when: ansible_facts['os_family'] == 'RedHat'
+
+        - name: Set reboot required fact
+          ansible.builtin.set_fact:
+            reboot_required: >-
+              {% if ansible_facts['os_family'] == 'Debian' %}
+              {{ deb_reboot_required.stat.exists | default(false) }}
+              {% elif ansible_facts['os_family'] == 'RedHat' %}
+              {{ rhel_reboot_required.rc | default(0) != 0 }}
+              {% else %}
+              false
+              {% endif %}
+
+        - name: Report update summary
+          ansible.builtin.uri:
+            url: "{{ status_url }}"
+            method: POST
+            body_format: json
+            body:
+              host: "{{ patching_host }}"
+              step: "Patch Install"
+              status: "Completed"
+          failed_when: false
+
+        - name: Reboot server
+          ansible.builtin.reboot:
+            reboot_timeout: 3600
+          when: reboot_if_needed
+
+        - name: Report reboot complete
+          ansible.builtin.uri:
+            url: "{{ status_url }}"
+            method: POST
+            body_format: json
+            body:
+              host: "{{ patching_host }}"
+              step: "Reboot"
+              status: "Complete"
+          failed_when: false
+          when: reboot_if_needed
+      rescue:
+        - name: Report patching failed
+          ansible.builtin.uri:
+            url: "{{ status_url }}"
+            method: POST
+            body_format: json
+            body:
+              host: "{{ patching_host }}"
+              step: "install"
+              status: "Failed"
+          failed_when: false
+
+        - name: Fail play after reporting
+          ansible.builtin.fail:
+            msg: "Linux patching failed."
+
+    - name: Report patching complete
+      ansible.builtin.uri:
+        url: "{{ status_url }}"
+        method: POST
+        body_format: json
+        body:
+          host: "{{ patching_host }}"
+          step: "complete"
+          status: "Success"
+      failed_when: false

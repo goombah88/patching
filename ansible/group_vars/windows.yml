@@ -1,0 +1,9 @@
+---
+status_url: "http://172.16.150.49:9999/status"
+update_categories:
+  - SecurityUpdates
+  - CriticalUpdates
+  - UpdateRollups
+  - DefinitionUpdates
+  - Updates
+ansible_password: "{{ lookup('pipe', 'python3 ansible/vault_password.py') }}"

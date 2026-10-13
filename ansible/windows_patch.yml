@@ -1,0 +1,94 @@
+---
+- name: Windows patching
+  hosts: windows
+  gather_facts: true
+  collections:
+    - ansible.windows
+
+  vars:
+    status_url: "{{ status_url | default('http://127.0.0.1:9999/status') }}"
+    update_categories: "{{ update_categories | default(['SecurityUpdates', 'CriticalUpdates', 'UpdateRollups', 'DefinitionUpdates', 'Updates']) }}"
+
+  tasks:
+    - name: Set host name for status updates
+      ansible.builtin.set_fact:
+        patching_host: "{{ ansible_fqdn | default(inventory_hostname) }}"
+
+    - name: Report patching start
+      ansible.windows.win_uri:
+        url: "{{ status_url }}"
+        method: POST
+        body_format: json
+        body:
+          host: "{{ patching_host }}"
+          step: "start"
+          status: "In Progress"
+      failed_when: false
+
+    - name: Apply Windows updates
+      block:
+        - name: Install Windows updates
+          ansible.windows.win_updates:
+            category_names: "{{ update_categories }}"
+            reboot: false
+            reboot_timeout: 3600
+          register: win_updates_result
+
+        - name: Report update summary
+          ansible.windows.win_uri:
+            url: "{{ status_url }}"
+            method: POST
+            body_format: json
+            body:
+              host: "{{ patching_host }}"
+              step: "install"
+              status: >-
+                {% set found = win_updates_result.found_update_count | default(0) %}
+                {% set installed = win_updates_result.installed_update_count | default(0) %}
+                {% if found == 0 %}
+                No Updates
+                {% else %}
+                Installed {{ installed }} of {{ found }}
+                {% endif %}
+          failed_when: false
+
+        - name: Reboot server
+          ansible.windows.win_reboot:
+            reboot_timeout: 3600
+
+        - name: Report reboot complete
+          ansible.windows.win_uri:
+            url: "{{ status_url }}"
+            method: POST
+            body_format: json
+            body:
+              host: "{{ patching_host }}"
+              step: "Reboot"
+              status: "Complete"
+          failed_when: false
+      rescue:
+        - name: Report patching failed
+          ansible.windows.win_uri:
+            url: "{{ status_url }}"
+            method: POST
+            body_format: json
+            body:
+              host: "{{ patching_host }}"
+              step: "install"
+              status: "Failed"
+          failed_when: false
+
+        - name: Fail play after reporting
+          ansible.builtin.fail:
+            msg: "Windows patching failed."
+
+    - name: Report patching complete
+      ansible.windows.win_uri:
+        url: "{{ status_url }}"
+        method: POST
+        body_format: json
+        body:
+          host: "{{ patching_host }}"
+          step: "complete"
+          status: "Success"
+      failed_when: false

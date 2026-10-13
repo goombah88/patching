@@ -1,0 +1,9 @@
+patching nights?
+patching during the day?
+
+server dependencies?
+db for app, etc.
+servers in order
+different nights?
+
+email patching summary to mgmt
